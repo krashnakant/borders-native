@@ -71,10 +71,12 @@ var lastFrame = CGRect.null
 func show(_ axFrame: CGRect, wid: CGWindowID, radius: CGFloat, reorder: Bool = true) {
   if reorder { overlay.order(.above, relativeTo: Int(wid)) }
   guard axFrame != lastFrame else { return } // moves arrive twice (app + window observers)
+  let sameSize = axFrame.size == lastFrame.size
   lastFrame = axFrame
   // AX uses top-left origin on the primary screen; Cocoa uses bottom-left.
   let primaryH = NSScreen.screens.first?.frame.height ?? 0
   let target = CGRect(x: axFrame.minX, y: primaryH - axFrame.maxY, width: axFrame.width, height: axFrame.height)
+  if sameSize { return overlay.setFrameOrigin(CGPoint(x: target.minX - pad, y: target.minY - pad)) } // drag: no redraw
   CATransaction.begin()
   CATransaction.setDisableActions(true)
   overlay.setFrame(target.insetBy(dx: -pad, dy: -pad), display: false)
@@ -110,6 +112,38 @@ func cornerRadius(_ wid: CGWindowID) -> CGFloat? {
         let r = (radii(it)?.takeRetainedValue() as? [NSNumber])?.first?.doubleValue, r > 0
   else { return nil }
   return CGFloat(r)
+}
+
+// Window-server move/resize events (what JankyBorders uses): fire every frame while dragging,
+// unlike AX moved notifications, which apps post late, coalesced, or only on mouse-up.
+typealias NotifyProc = @convention(c) (UInt32, UnsafeMutableRawPointer?, Int, UnsafeMutableRawPointer?) -> Void
+let SLSRegisterNotifyProc = skyFn("SLSRegisterNotifyProc", (@convention(c) (NotifyProc, UInt32, UnsafeMutableRawPointer?) -> Int32).self)
+let SLSRequestNotificationsForWindows = skyFn("SLSRequestNotificationsForWindows", (@convention(c) (Int32, UnsafePointer<UInt32>, Int32) -> Int32).self)
+let SLSGetWindowBounds = skyFn("SLSGetWindowBounds", (@convention(c) (Int32, UInt32, UnsafeMutablePointer<CGRect>) -> Int32).self)
+let kWindowMoved: UInt32 = 806, kWindowResized: UInt32 = 807
+var wsEvents = false // true once window-server move/resize handlers are registered
+
+// Window-server bounds use the same top-left global coordinates as AX.
+func wsBounds(_ wid: CGWindowID) -> CGRect? {
+  guard let get = SLSGetWindowBounds, let cid = SLSMainConnectionID?() else { return nil }
+  var r = CGRect.zero
+  return get(cid, wid, &r) == 0 && r.width > 0 ? r : nil
+}
+
+func watchWindowServer(_ wid: CGWindowID) {
+  guard wsEvents, let request = SLSRequestNotificationsForWindows, let cid = SLSMainConnectionID?() else { return }
+  var w = wid
+  _ = request(cid, &w, 1) // replaces the previous window
+}
+
+let wsCallback: NotifyProc = { _, data, _, _ in
+  guard let wid = data?.load(as: UInt32.self) else { return }
+  let move = {
+    guard wid == trackedWid else { return }
+    guard overlay.isVisible, let r = wsBounds(wid) else { return update() } // hidden by a transient failure: re-check
+    show(r, wid: wid, radius: trackedRadius, reorder: false)
+  }
+  if Thread.isMainThread { move() } else { DispatchQueue.main.async(execute: move) }
 }
 
 func onScreen(_ wid: CGWindowID) -> Bool {
@@ -172,9 +206,10 @@ func update() {
     trackedRadius = square ? 0 : radiusOverride ?? cornerRadius(trackedWid) ?? 9
     // focused window on another space: don't draw it on this one
     if trackedWid != 0, !onScreen(trackedWid) { trackedWid = 0 }
+    if trackedWid != 0 { watchWindowServer(trackedWid) }
   }
   guard trackedWid != 0 else { trackedWin = nil; return hide() } // re-resolve next event
-  show(f, wid: trackedWid, radius: trackedRadius)
+  show(wsBounds(trackedWid) ?? f, wid: trackedWid, radius: trackedRadius) // AX frame can be stale mid-drag
 }
 
 let axCallback: AXObserverCallback = { _, el, note, _ in
@@ -185,7 +220,8 @@ let axCallback: AXObserverCallback = { _, el, note, _ in
   case kAXMovedNotification, kAXResizedNotification, kAXWindowMovedNotification, kAXWindowResizedNotification:
     // hot path while dragging: only the tracked window's frame, no focus/state re-query, no restack
     guard let w = trackedWin, CFEqual(w, el) else { return }
-    guard overlay.isVisible, let f = frame(of: w) else { return update() } // hidden (e.g. fullscreen): full re-check
+    // fallback if window-server events stop; read bounds from the window server anyway, AX frames lag mid-drag
+    guard overlay.isVisible, let f = wsBounds(trackedWid) ?? frame(of: w) else { return update() }
     return show(f, wid: trackedWid, radius: trackedRadius, reorder: false)
   case kAXUIElementDestroyedNotification, kAXWindowMiniaturizedNotification:
     guard let w = trackedWin, CFEqual(w, el) else { return } // some other window
@@ -220,10 +256,16 @@ func observe(_ a: NSRunningApplication) {
 
 // MARK: main
 
-// Prompt once, then wait: exiting would make launchd respawn us and re-prompt in a loop.
-if !AXIsProcessTrustedWithOptions([kAXTrustedCheckOptionPrompt.takeUnretainedValue(): true] as CFDictionary) {
-  print("Waiting for Accessibility permission (System Settings > Privacy & Security > Accessibility)...")
-  while !AXIsProcessTrusted() { sleep(1) }
+// Prompt once, then wait. The trust answer is cached per process, so re-exec ourselves
+// (same pid, no new prompt) to re-check; exiting would make launchd respawn and re-prompt.
+if !AXIsProcessTrustedWithOptions([kAXTrustedCheckOptionPrompt.takeUnretainedValue(): getenv("BORDERS_PROMPTED") == nil] as CFDictionary) {
+  if getenv("BORDERS_PROMPTED") == nil {
+    print("Waiting for Accessibility permission (System Settings > Privacy & Security > Accessibility)...")
+  }
+  setenv("BORDERS_PROMPTED", "1", 1)
+  sleep(2)
+  execv(CommandLine.arguments[0].hasPrefix("/") ? CommandLine.arguments[0] : Bundle.main.executablePath!, CommandLine.unsafeArgv)
+  exit(1)
 }
 
 // Default AX timeout is ~6s; a closing/hung app would freeze the border that long.
@@ -261,6 +303,9 @@ NotificationCenter.default.addObserver(forName: .NSProcessInfoPowerStateDidChang
 ws.addObserver(forName: NSWorkspace.didWakeNotification, object: nil, queue: .main) { _ in trackedWin = nil; update() }
 ws.addObserver(forName: NSWorkspace.screensDidWakeNotification, object: nil, queue: .main) { _ in trackedWin = nil; update() }
 
+if let register = SLSRegisterNotifyProc {
+  wsEvents = register(wsCallback, kWindowMoved, nil) == 0 && register(wsCallback, kWindowResized, nil) == 0
+}
 NSWorkspace.shared.runningApplications.forEach(observe)
 frontPid = NSWorkspace.shared.frontmostApplication?.processIdentifier ?? 0
 update()

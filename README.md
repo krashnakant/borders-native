@@ -13,11 +13,14 @@ which tend to break between macOS releases. borders-native does the heavy liftin
 - **Accessibility API** (`AXObserver`) to follow focus, moves, resizes, minimize, close and app switches
 - **AppKit + Core Animation** (a click-through overlay `NSWindow` with a `CAShapeLayer`) to draw the border
 
-Only two small private calls remain, both widely used (yabai, JankyBorders, AltTab) and both optional:
+A few small private calls remain, all widely used (yabai, JankyBorders, AltTab) and all optional:
 
 - `_AXUIElementGetWindow`: the window id of the focused window, for stacking the border right above it
 - `SLSWindowIteratorGetCornerRadii`: the window's real corner radius, so the border hugs each window's
   corners (macOS 26+ uses different radii per window type). If it is unavailable, a radius of 9 is used.
+- `SLSRegisterNotifyProc` / `SLSRequestNotificationsForWindows` / `SLSGetWindowBounds`: window-server move and
+  resize events for the focused window, which arrive every frame while dragging (AX move notifications arrive
+  late, coalesced, or only on mouse-up). Without them the border falls back to AX events and lags during drags.
 
 ## Features
 
@@ -26,7 +29,8 @@ Only two small private calls remain, both widely used (yabai, JankyBorders, AltT
 - Solid color or `glow(...)`
 - Hides on minimize, close, hide (⌘H), quit and native fullscreen
 - Survives sleep/wake, display changes and Low Power Mode switches
-- Cheap while dragging: only the window frame is read, no restacking, glow uses a precomputed shadow path
+- Smooth and cheap while dragging: per-frame window-server events, a plain drag only moves the overlay
+  (no redraw, no restacking), glow uses a precomputed shadow path
 
 ## Requirements
 
@@ -61,8 +65,8 @@ borders-native active_color="glow(0xffa855f7)" width=3.0 style=round
 
 Unsupported JankyBorders options (`inactive_color`, `hidpi`, `blacklist`, gradients, ...) are ignored with a message.
 
-On first run macOS asks for Accessibility permission. The process waits until it is granted and then starts
-drawing, no restart needed. Grant it in System Settings → Privacy & Security → Accessibility.
+On first run macOS asks for Accessibility permission. The process waits (re-checking every 2 seconds) until it
+is granted and then starts drawing, no restart needed. Grant it in System Settings → Privacy & Security → Accessibility.
 
 > The binary is ad-hoc signed, so every rebuild changes its signature and macOS asks for the permission again.
 
@@ -124,4 +128,5 @@ Move the options from `~/.config/borders/bordersrc` into the plist above; border
    and the overlay is ordered directly above it.
 3. The overlay is a borderless, transparent, mouse-transparent `NSWindow` on all Spaces whose layer-hosting
    view is a `CAShapeLayer` stroking a rounded rect just outside the window frame.
-4. Moves and resizes only re-read the frame and update the path, with implicit animations disabled.
+4. Window-server move/resize events for the focused window move the overlay (drag) or redraw the path
+   (resize), with implicit animations disabled. AX move events remain as a fallback.
