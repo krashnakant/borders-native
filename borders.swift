@@ -194,7 +194,9 @@ func update() {
         (attr(win, kAXSubroleAttribute) as String?) == kAXStandardWindowSubrole
   else { return hide() }
 
-  if trackedWin == nil || !CFEqual(trackedWin, win) {
+  // Re-subscribe after drawing: unsubscribing from a frozen old app blocks for the AX timeout
+  // per call (~1.2s for all four), which used to hold back the new border.
+  defer {
     if observedWin == nil || !CFEqual(observedWin, win) {
       for n in windowNotes {
         if let old = observedWin, let o = observers[observedPid] { AXObserverRemoveNotification(o, old, n as CFString) }
@@ -203,6 +205,8 @@ func update() {
       observedWin = win
       observedPid = frontPid
     }
+  }
+  if trackedWin == nil || !CFEqual(trackedWin, win) {
     trackedWin = win
     trackedPid = frontPid
     lastFrame = .null // same-frame window (tabs) may still need a new radius
