@@ -47,6 +47,7 @@ overlay.backgroundColor = .clear
 overlay.hasShadow = false
 overlay.ignoresMouseEvents = true
 overlay.isReleasedWhenClosed = false
+overlay.animationBehavior = .none // no system fade/zoom when ordered in after a hide
 overlay.collectionBehavior = [.canJoinAllSpaces, .stationary, .ignoresCycle, .fullScreenAuxiliary]
 
 let shape = CAShapeLayer()
@@ -69,7 +70,7 @@ overlay.contentView = host
 var lastFrame = CGRect.null
 
 func show(_ axFrame: CGRect, wid: CGWindowID, radius: CGFloat, reorder: Bool = true) {
-  if reorder { overlay.order(.above, relativeTo: Int(wid)) }
+  defer { if reorder { overlay.order(.above, relativeTo: Int(wid)) } } // after frame + ring are in place
   guard axFrame != lastFrame else { return } // moves arrive twice (app + window observers)
   let sameSize = axFrame.size == lastFrame.size
   lastFrame = axFrame
@@ -77,6 +78,10 @@ func show(_ axFrame: CGRect, wid: CGWindowID, radius: CGFloat, reorder: Bool = t
   let primaryH = NSScreen.screens.first?.frame.height ?? 0
   let target = CGRect(x: axFrame.minX, y: primaryH - axFrame.maxY, width: axFrame.width, height: axFrame.height)
   if sameSize { return overlay.setFrameOrigin(CGPoint(x: target.minX - pad, y: target.minY - pad)) } // drag: no redraw
+  // Focus switch: the window server applies the new frame before the new ring renders, so for a frame
+  // the old ring shows stretched into the new window. Hide while resizing, show once the ring is committed.
+  if reorder { overlay.orderOut(nil) }
+  defer { if reorder { CATransaction.flush() } }
   CATransaction.begin()
   CATransaction.setDisableActions(true)
   overlay.setFrame(target.insetBy(dx: -pad, dy: -pad), display: false)
