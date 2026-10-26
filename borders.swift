@@ -121,7 +121,7 @@ typealias NotifyProc = @convention(c) (UInt32, UnsafeMutableRawPointer?, Int, Un
 let SLSRegisterNotifyProc = skyFn("SLSRegisterNotifyProc", (@convention(c) (NotifyProc, UInt32, UnsafeMutableRawPointer?) -> Int32).self)
 let SLSRequestNotificationsForWindows = skyFn("SLSRequestNotificationsForWindows", (@convention(c) (Int32, UnsafePointer<UInt32>, Int32) -> Int32).self)
 let SLSGetWindowBounds = skyFn("SLSGetWindowBounds", (@convention(c) (Int32, UInt32, UnsafeMutablePointer<CGRect>) -> Int32).self)
-let kWindowMoved: UInt32 = 806, kWindowResized: UInt32 = 807
+let kWindowMoved: UInt32 = 806, kWindowResized: UInt32 = 807, kWindowOrdered: UInt32 = 808
 var wsEvents = false // true once window-server move/resize handlers are registered
 
 // Window-server bounds use the same top-left global coordinates as AX.
@@ -137,10 +137,12 @@ func watchWindowServer(_ wid: CGWindowID) {
   _ = request(cid, &w, 1) // replaces the previous window
 }
 
-let wsCallback: NotifyProc = { _, data, _, _ in
+let wsCallback: NotifyProc = { type, data, _, _ in
   guard let wid = data?.load(as: UInt32.self) else { return }
   let move = {
     guard wid == trackedWid else { return }
+    // window raised (e.g. after Cmd+Tab, often after we drew): keep the border right above it
+    if type == kWindowOrdered { if overlay.isVisible { overlay.order(.above, relativeTo: Int(wid)) }; return }
     guard overlay.isVisible, let r = wsBounds(wid) else { return update() } // hidden by a transient failure: re-check
     show(r, wid: wid, radius: trackedRadius, reorder: false)
   }
@@ -188,7 +190,7 @@ func update() {
         (attr(win, kAXMinimizedAttribute) as Bool?) != true,
         (attr(win, "AXFullScreen") as Bool?) != true,
         (attr(win, kAXSubroleAttribute) as String?) == kAXStandardWindowSubrole
-  else { return hide() }
+  else { lastWindow[frontPid] = nil; return hide() } // e.g. now fullscreen: don't fast-draw it next time
 
   // Re-subscribe after drawing: unsubscribing from a frozen old app blocks for the AX timeout
   // per call (~1.2s for all four), which used to hold back the new border.
@@ -213,15 +215,30 @@ func update() {
     if trackedWid != 0, !onScreen(trackedWid) { trackedWid = 0 }
     if trackedWid != 0 { watchWindowServer(trackedWid) }
   }
-  guard trackedWid != 0 else { trackedWin = nil; return hide() } // re-resolve next event
+  guard trackedWid != 0 else { trackedWin = nil; lastWindow[frontPid] = nil; return hide() } // re-resolve next event
+  lastWindow[frontPid] = (win, trackedWid, trackedRadius)
   show(wsBounds(trackedWid) ?? f, wid: trackedWid, radius: trackedRadius) // AX frame can be stale mid-drag
+}
+
+// Each app's last focused window. On activation the AX focus query waits for the app, which is
+// busy activating (measured 0-60 ms), so draw on the remembered window first; update() corrects it.
+var lastWindow: [pid_t: (win: AXUIElement, wid: CGWindowID, radius: CGFloat)] = [:]
+
+func activated(_ pid: pid_t) {
+  frontPid = pid
+  guard let c = lastWindow[pid], onScreen(c.wid), let r = wsBounds(c.wid) else { return }
+  if trackedWin == nil || !CFEqual(trackedWin, c.win) { lastFrame = .null } // new radius may apply
+  trackedWin = c.win; trackedPid = pid; trackedWid = c.wid; trackedRadius = c.radius
+  watchWindowServer(c.wid)
+  show(r, wid: c.wid, radius: c.radius) // window not raised yet: the kWindowOrdered event restacks
+  CATransaction.flush() // on screen now, not after update()'s AX wait
 }
 
 let axCallback: AXObserverCallback = { _, el, note, _ in
   var pid: pid_t = 0
   AXUIElementGetPid(el, &pid)
   switch note as String {
-  case kAXApplicationActivatedNotification: frontPid = pid
+  case kAXApplicationActivatedNotification: if pid != frontPid { activated(pid) }
   case kAXMovedNotification, kAXResizedNotification, kAXWindowMovedNotification, kAXWindowResizedNotification:
     // hot path while dragging: only the tracked window's frame, no focus/state re-query, no restack
     guard let w = trackedWin, CFEqual(w, el) else { return }
@@ -283,7 +300,9 @@ let ws = NSWorkspace.shared.notificationCenter
 func running(_ n: Notification) -> NSRunningApplication? { n.userInfo?[NSWorkspace.applicationUserInfoKey] as? NSRunningApplication }
 ws.addObserver(forName: NSWorkspace.didLaunchApplicationNotification, object: nil, queue: .main) { n in running(n).map(observe) }
 ws.addObserver(forName: NSWorkspace.didTerminateApplicationNotification, object: nil, queue: .main) { n in
-  guard let pid = running(n)?.processIdentifier, let o = observers.removeValue(forKey: pid) else { return }
+  guard let pid = running(n)?.processIdentifier else { return }
+  lastWindow[pid] = nil
+  guard let o = observers.removeValue(forKey: pid) else { return }
   CFRunLoopRemoveSource(CFRunLoopGetMain(), AXObserverGetRunLoopSource(o), .commonModes)
   if pid == trackedPid { trackedPid = 0; dropBorder() }
 }
@@ -291,7 +310,7 @@ ws.addObserver(forName: NSWorkspace.didTerminateApplicationNotification, object:
 ws.addObserver(forName: NSWorkspace.didActivateApplicationNotification, object: nil, queue: .main) { n in
   guard let a = running(n), a.processIdentifier != frontPid else { return }
   observe(a)
-  frontPid = a.processIdentifier
+  activated(a.processIdentifier)
   update()
 }
 ws.addObserver(forName: NSWorkspace.activeSpaceDidChangeNotification, object: nil, queue: .main) { _ in
@@ -310,6 +329,7 @@ ws.addObserver(forName: NSWorkspace.screensDidWakeNotification, object: nil, que
 
 if let register = SLSRegisterNotifyProc {
   wsEvents = register(wsCallback, kWindowMoved, nil) == 0 && register(wsCallback, kWindowResized, nil) == 0
+  _ = register(wsCallback, kWindowOrdered, nil)
 }
 NSWorkspace.shared.runningApplications.forEach(observe)
 frontPid = NSWorkspace.shared.frontmostApplication?.processIdentifier ?? 0
