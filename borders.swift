@@ -243,13 +243,21 @@ func dropBorder() {
   DispatchQueue.main.asyncAfter(deadline: .now() + 0.2, execute: update)
 }
 
+var observeTries: [pid_t: Int] = [:] // shared by all retry chains of a pid, so repeated activations cannot multiply them
 func observe(_ a: NSRunningApplication) {
   let pid = a.processIdentifier
   guard a.activationPolicy == .regular, pid != getpid(), observers[pid] == nil else { return }
   var o: AXObserver?
   guard AXObserverCreate(pid, axCallback, &o) == .success, let o else { return }
   let el = AXUIElementCreateApplication(pid)
-  for n in appNotes { AXObserverAddNotification(o, el, n as CFString, nil) }
+  // An app that is still launching answers cannotComplete; retry for ~10s rather than keep an observer that never fires.
+  // Any other error is final: keep whatever registered.
+  let launching = appNotes.map { AXObserverAddNotification(o, el, $0 as CFString, nil) }.contains(.cannotComplete)
+  if launching, !a.isTerminated, observeTries[pid, default: 0] < 20 {
+    observeTries[pid, default: 0] += 1
+    return DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) { observe(a) }
+  }
+  observeTries[pid] = nil
   CFRunLoopAddSource(CFRunLoopGetMain(), AXObserverGetRunLoopSource(o), .commonModes)
   observers[pid] = o
 }
